@@ -149,25 +149,30 @@ impl SftpHandle {
     }
 
     /// Stream-download a remote file to a local path with a hard size cap.
-    /// 超过 max_bytes 直接 bail（不开始下载）。无前端进度事件——AI 排障流程
-    /// 用，前端不需要进度条。
+    /// 优先用 metadata.size 早期 bail；metadata.size=None 或服务器撒谎时，
+    /// 流式 cap 也会在超限的瞬间中止下载（**此时 local_path 会留下部分内容**）。
+    /// 无前端进度事件——AI 排障流程用，前端不需要进度条。
     pub async fn download_to_path(
         &self,
         remote_path: &str,
         local_path: &Path,
         max_bytes: u64,
     ) -> AppResult<u64> {
+        // 预检：metadata 已知大小且超限就早 bail，省一次 open。size=None
+        // 时不能假装它是 0（之前的 unwrap_or(0) 会让任何"未声明大小"的文件
+        // 直接绕过 max_bytes）—— 交给下面的 streaming cap 兜底。
         let meta = self
             .sftp
             .metadata(remote_path)
             .await
             .map_err(|e| AppError::sftp("sftp_io_failed", json!({ "op": "metadata", "err": e.to_string() })))?;
-        let total = meta.size.unwrap_or(0);
-        if total > max_bytes {
-            return Err(AppError::sftp(
-                "sftp_file_too_large",
-                json!({ "path": remote_path, "size": total, "limit": max_bytes }),
-            ));
+        if let Some(size) = meta.size {
+            if size > max_bytes {
+                return Err(AppError::sftp(
+                    "sftp_file_too_large",
+                    json!({ "path": remote_path, "size": size, "limit": max_bytes }),
+                ));
+            }
         }
 
         let mut remote_file = self
@@ -187,8 +192,20 @@ impl SftpHandle {
             if n == 0 {
                 break;
             }
+            // 运行时 cap：metadata 缺失 / 撒谎 / 下载途中文件增长都靠这里兜底。
+            // 这是 max_bytes 的唯一权威检查点，预检只是优化。
+            let next = transferred + n as u64;
+            if next > max_bytes {
+                // 主动关闭 server-side handle，免得让远端 fd 等到 session drop 才回收。
+                // close 自身的错误不重要 —— 我们已经在返回 file_too_large 了。
+                let _ = remote_file.shutdown().await;
+                return Err(AppError::sftp(
+                    "sftp_file_too_large",
+                    json!({ "path": remote_path, "size": next, "limit": max_bytes }),
+                ));
+            }
             local_file.write_all(&buf[..n]).await?;
-            transferred += n as u64;
+            transferred = next;
         }
 
         remote_file
