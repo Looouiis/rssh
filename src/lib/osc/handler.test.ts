@@ -112,8 +112,10 @@ describe("open: handler", () => {
     );
   });
 
-  it("opens tab even when get_credential throws (silently)", async () => {
-    const { dispatch } = setup();
+  it("reports error and does NOT open tab when get_credential throws", async () => {
+    // 旧行为：cred 拿不到也开 tab（注定连不上），用户要再等一次往返才报错。
+    // 新行为（应 CodeRabbit #7 的 review）：立即 ctx.error + return，不开死 tab。
+    const { dispatch, reporter } = setup();
     (invoke as any).mockImplementation(async (cmd: string) => {
       if (cmd === "list_profiles")
         return [
@@ -132,28 +134,18 @@ describe("open: handler", () => {
     expect(dispatch("open:h")).toBe(true);
     await flush();
 
-    expect(app.addTab).toHaveBeenCalledTimes(1);
-    const meta = (app.addTab as any).mock.calls[0][0].meta;
-    // credential 拿不到 → username/secret 取默认空值，authType 用 password 默认
-    expect(meta.username).toBe("");
-    expect(meta.authType).toBe("password");
+    expect(app.addTab).not.toHaveBeenCalled();
+    expect(reporter.error).toHaveBeenCalledTimes(1);
+    const msg = (reporter.error as any).mock.calls[0][0] as string;
+    expect(msg).toContain("Profile 'h'");
+    expect(msg).toContain("denied");
   });
 
-  it("skips get_credential when profile has no credential_id", async () => {
-    const { dispatch } = setup();
-    const calls: string[] = [];
-    (invoke as any).mockImplementation(async (cmd: string) => {
-      calls.push(cmd);
-      if (cmd === "list_profiles")
-        return [{ id: "p1", name: "h", host: "h", port: 22, credential_id: "" }];
-      throw new Error(`unexpected ${cmd}`);
-    });
-
-    expect(dispatch("open:h")).toBe(true);
-    await flush();
-    expect(calls).toEqual(["list_profiles"]);
-    expect(app.addTab).toHaveBeenCalledTimes(1);
-  });
+  // 旧测试 "skips get_credential when profile has no credential_id" 已删——
+  // 应用层不变量：DB 中的 Profile.credential_id 永远非空（add/edit/import 强制
+  // 必填），所以"profile 没 credential_id"这个场景不应该存在。上面那条
+  // "opens tab even when get_credential throws (silently)" 已经覆盖了
+  // DB 不一致（cred 引用 broken）时的 fallback 路径。
 });
 
 describe("fwd: handler", () => {

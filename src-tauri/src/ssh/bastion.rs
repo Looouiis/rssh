@@ -25,9 +25,7 @@ pub const MAX_HOPS: usize = 8;
 pub fn resolve_chain(db: &Db, target: &Profile) -> AppResult<Vec<Profile>> {
     let mut chain: Vec<Profile> = Vec::new();
     let mut visited: HashSet<String> = HashSet::new();
-    if !target.id.is_empty() {
-        visited.insert(target.id.clone());
-    }
+    visited.insert(target.id.clone());
 
     let mut next_id = target.bastion_profile_id.clone();
     while let Some(bid) = next_id {
@@ -82,7 +80,9 @@ mod tests {
             name: name.to_string(),
             host: format!("{name}.local"),
             port: 22,
-            credential_id: String::new(),
+            // db::profile::insert 现在 enforce credential_id 非空（应用层不变量）；
+            // 测试只关心 chain 解析，cred 是否真存在不重要，给个 placeholder。
+            credential_id: "test-cred".into(),
             bastion_profile_id: bastion_id.map(|s| s.to_string()),
             init_command: None,
             group_id: None,
