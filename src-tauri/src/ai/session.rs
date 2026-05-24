@@ -528,14 +528,66 @@ impl Actor {
             remote_path: input.remote_path.clone(),
             max_mb: input.max_mb,
         });
+
+        // 审批卡片：跟 run_command / patch_file 同一个 command_proposed 事件，前端按
+        // kind="download_file" 决定是否走 auto_download_file 自动批准。SFTP 不走 PTY，
+        // 所以 full_cmd/sentinel 填空——前端识别 kind 后直接 ack 不发命令到终端。
+        //
+        // side_effect 展示实际写入目录前缀（绝对路径），避免用 `~/.../` 这种省略号文案
+        // 让用户误以为是真路径片段。
+        let dest_dir = self
+            .cfg
+            .data_dir
+            .join("diagnose")
+            .join(&self.cfg.session_id);
         self.emit(
-            "download_started",
+            "command_proposed",
             json!({
                 "id": dl_id,
-                "remote_path": input.remote_path,
-                "max_mb": input.max_mb,
+                "tool_call_id": tc.id,
+                "cmd": format!("download_file: {} (max {} MB)", input.remote_path, input.max_mb),
+                "full_cmd": "",
+                "sentinel": "",
+                "explain": "SFTP download remote artifact to local rssh data dir for offline analysis.",
+                "side_effect": format!("Write under {}/", dest_dir.display()),
+                "timeout_s": 600,
+                "kind": "download_file",
             }),
         );
+        // 跟 run_command 一致：审批 + 实际执行的端到端耗时计入 duration_ms，
+        // 前端 CommandResult.duration_ms 期待这个字段，缺了会渲染 "undefinedms"。
+        let started_at = std::time::Instant::now();
+
+        match self.wait_command_outcome(&tc.id).await? {
+            CommandOutcome::Rejected { reason } => {
+                self.audit_push(AuditKind::CommandRejected {
+                    id: dl_id.clone(),
+                    reason: reason.clone(),
+                });
+                // UI 卡片切到结果态：前端等 ai:command_completed 把 chat item 标 done。
+                self.emit(
+                    "command_completed",
+                    json!({
+                        "id": dl_id,
+                        "exit_code": 1,
+                        "timed_out": false,
+                        "early_terminated": false,
+                        // 卡片 output 是给用户看的，按 AGENT.md Pr1 用中文。
+                        // push_tool_error 内容保持英文 —— 喂给 LLM 推理用。
+                        "output": format!("已拒绝：{reason}"),
+                        "original_bytes": 0,
+                        "truncated_bytes": 0,
+                        "duration_ms": started_at.elapsed().as_millis() as u64,
+                    }),
+                );
+                self.push_tool_error(
+                    &tc.id,
+                    &format!("User rejected download_file. Reason: {reason}."),
+                );
+                return Ok(());
+            }
+            CommandOutcome::Result { .. } => { /* approved (前端 ack)，继续实际 SFTP */ }
+        }
 
         let basename = std::path::Path::new(&input.remote_path)
             .file_name()
@@ -555,7 +607,21 @@ impl Actor {
                 .await
                 .map_err(|e| AppError::other("ai_local_dir_create_failed", json!({ "err": e.to_string() })))?;
             let sftp = SftpHandle::from_handle(&ssh_handle, self.cfg.target_id.clone()).await?;
-            sftp.download_to_path(&input.remote_path, &local_path, max_bytes)
+            // SFTP 不展开 `~` —— 协议层直接把字面 `~/foo` 当文件名 stat，必然 ENOENT。
+            // LLM 习惯先 `ls ~/foo` 验证（shell 展开了），再原样塞进 remote_path。
+            // 在入口把 `~` / `~/` 替换成 sftp.home_dir() canonicalize 出来的绝对路径。
+            // 其它形态（`~user/...`）SFTP 没法解，留给用户自己写绝对路径。
+            let resolved = if input.remote_path == "~" || input.remote_path.starts_with("~/") {
+                let home = sftp.home_dir().await?;
+                if input.remote_path == "~" {
+                    home
+                } else {
+                    format!("{home}/{}", &input.remote_path[2..])
+                }
+            } else {
+                input.remote_path.clone()
+            };
+            sftp.download_to_path(&resolved, &local_path, max_bytes)
                 .await
         }
         .await;
@@ -568,12 +634,18 @@ impl Actor {
                     local_path: local_str.clone(),
                     bytes,
                 });
+                let card_output = format!("已下载 {} 字节 → {}", bytes, local_str);
                 self.emit(
-                    "download_completed",
+                    "command_completed",
                     json!({
                         "id": dl_id,
-                        "local_path": local_str,
-                        "bytes": bytes,
+                        "exit_code": 0,
+                        "timed_out": false,
+                        "early_terminated": false,
+                        "output": card_output,
+                        "original_bytes": card_output.len(),
+                        "truncated_bytes": 0,
+                        "duration_ms": started_at.elapsed().as_millis() as u64,
                     }),
                 );
                 self.history.push(ChatMessage::ToolResult {
@@ -589,6 +661,33 @@ impl Actor {
                 self.audit_push(AuditKind::Note {
                     message: format!("download_file failed: {e}"),
                 });
+                // 卡片 output 是给用户看的文本，不能塞 AppError 的 `__rssh_err__|JSON` 协议串
+                // （那是给前端 errMsg() 翻译用的，渲染到 <pre> 里就是赤裸的协议体）。
+                // 用 code() 给个语义分类 + 远端路径让用户辨识，足以指导下一步动作。
+                let card_msg = match e.code() {
+                    "sftp_file_too_large" => format!(
+                        "远端文件超出 {MAX_DOWNLOAD_MB} MB 上限：{}",
+                        input.remote_path
+                    ),
+                    "sftp_io_failed" => format!(
+                        "无法访问远端文件（不存在或不可读）：{}",
+                        input.remote_path
+                    ),
+                    _ => format!("下载失败：{}", input.remote_path),
+                };
+                self.emit(
+                    "command_completed",
+                    json!({
+                        "id": dl_id,
+                        "exit_code": 1,
+                        "timed_out": false,
+                        "early_terminated": false,
+                        "output": card_msg,
+                        "original_bytes": 0,
+                        "truncated_bytes": 0,
+                        "duration_ms": started_at.elapsed().as_millis() as u64,
+                    }),
+                );
                 let msg = if e.code() == "sftp_file_too_large" {
                     format!(
                         "Remote file {} exceeds rssh's {} MB download cap (size was discovered mid-transfer or grew past the requested max_mb). \
@@ -629,6 +728,52 @@ impl Actor {
             return Ok(());
         }
 
+        // 审批卡片：开新窗口副作用比较大（独立窗口、独立 AI 会话、消耗一次 API 调用），
+        // 走 command_proposed，前端按 kind="analyze_locally" 决策是否 auto-approve。
+        let card_id = uuid::Uuid::new_v4().to_string();
+        self.emit(
+            "command_proposed",
+            json!({
+                "id": card_id,
+                "tool_call_id": tc.id,
+                "cmd": format!("analyze_locally: {} ({})", input.local_path, input.task),
+                "full_cmd": "",
+                "sentinel": "",
+                "explain": "Spawn a new window with an independent AI session to analyze the local artifact.",
+                "side_effect": "New window opens; local AI session starts; current session unaffected.",
+                "timeout_s": 30,
+                "kind": "analyze_locally",
+            }),
+        );
+        let started_at = std::time::Instant::now();
+        match self.wait_command_outcome(&tc.id).await? {
+            CommandOutcome::Rejected { reason } => {
+                self.audit_push(AuditKind::CommandRejected {
+                    id: card_id.clone(),
+                    reason: reason.clone(),
+                });
+                self.emit(
+                    "command_completed",
+                    json!({
+                        "id": card_id,
+                        "exit_code": 1,
+                        "timed_out": false,
+                        "early_terminated": false,
+                        "output": format!("已拒绝：{reason}"),
+                        "original_bytes": 0,
+                        "truncated_bytes": 0,
+                        "duration_ms": started_at.elapsed().as_millis() as u64,
+                    }),
+                );
+                self.push_tool_error(
+                    &tc.id,
+                    &format!("User rejected analyze_locally. Reason: {reason}."),
+                );
+                return Ok(());
+            }
+            CommandOutcome::Result { .. } => { /* approved，继续实际开窗口 */ }
+        }
+
         // 把 handoff 注入到新窗口的 window.__rssh_ai_handoff；
         // 新窗口的 AppShell 在 onMount 里读它 → 建本地 shell tab → 启动独立 AI 会话 → 发首条消息。
         let handoff = json!({
@@ -658,6 +803,24 @@ impl Actor {
         // Tauri 2 把 .title()/.inner_size() 等窗口方法限定在 #[cfg(desktop)]，
         // 移动端不存在。analyze_locally 的本质就是开新窗口，移动端语义上不存在，
         // 直接告知 LLM 工具不可用。
+        // 简单的卡片关闭辅助：开窗成功 / 失败 / 移动端都得 emit command_completed，
+        // 否则 UI 上审批卡片一直停在 "executing"（前端已 ack 但没拿到结果事件）。
+        let emit_done = |this: &Self, exit: i32, output: String| {
+            this.emit(
+                "command_completed",
+                json!({
+                    "id": card_id,
+                    "exit_code": exit,
+                    "timed_out": false,
+                    "early_terminated": false,
+                    "output": output,
+                    "original_bytes": 0,
+                    "truncated_bytes": 0,
+                    "duration_ms": started_at.elapsed().as_millis() as u64,
+                }),
+            );
+        };
+
         #[cfg(desktop)]
         {
             use tauri::{WebviewUrl, WebviewWindowBuilder};
@@ -668,6 +831,7 @@ impl Actor {
                 .initialization_script(&init_script)
                 .build()
             {
+                emit_done(self, 1, format!("打开分析窗口失败：{e}"));
                 self.push_tool_error(
                     &tc.id,
                     &format!(
@@ -684,6 +848,7 @@ impl Actor {
                 ),
             });
 
+            emit_done(self, 0, format!("已打开分析窗口：{}", input.local_path));
             self.history.push(ChatMessage::ToolResult {
                 tool_call_id: tc.id,
                 content: format!(
@@ -699,6 +864,7 @@ impl Actor {
         #[cfg(mobile)]
         {
             let _ = (init_script, label);
+            emit_done(self, 1, "该功能仅支持桌面端".into());
             self.push_tool_error(
                 &tc.id,
                 "analyze_locally is desktop-only: this build cannot spawn additional windows. Continue diagnosis in the current session.",
@@ -752,6 +918,7 @@ impl Actor {
                 "explain": input.explain,
                 "side_effect": input.side_effect,
                 "timeout_s": timeout_s,
+                "kind": "run_command",
             }),
         );
 
@@ -795,6 +962,7 @@ impl Actor {
                             "output": trunc.text,
                             "original_bytes": trunc.original_bytes,
                             "truncated_bytes": trunc.truncated_bytes,
+                            "duration_ms": started_at.elapsed().as_millis() as u64,
                         }),
                     );
 

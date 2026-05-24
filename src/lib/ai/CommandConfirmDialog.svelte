@@ -1,8 +1,21 @@
+<script lang="ts" module>
+    /** ack-only 工具（download_file / analyze_locally）不走 PTY，
+     *  store 的 _runningExecutions 表登记的是 PTY 句柄，无法守门重入。
+     *  Dialog 实例可能销毁重建（panel close/reopen），且 result prop 在事件
+     *  抵达前是 undefined → isPending=true，会再次自动 approve 发重复 ack。
+     *
+     *  Set 必须在 `<script module>` 里 —— 写在 instance script 里每次组件 mount
+     *  都会新建一个，完全不能跨实例共享，等于没防护。
+     *  生命周期：invoke 成功后才 add；result/rejected 抵达由 $effect 清理。 */
+    const _ackedToolCalls = new Set<string>();
+</script>
+
 <script lang="ts">
     import { onMount } from "svelte";
+    import { invoke } from "@tauri-apps/api/core";
     import * as ai from "./store.svelte.ts";
     import { t, errMsg } from "../i18n/index.svelte.ts";
-    import type { CommandProposed, CommandResult } from "./types.ts";
+    import type { AiSettings, CommandKind, CommandProposed, CommandResult } from "./types.ts";
 
     let { sessionId, targetKind, targetSessionId, cmd, result, rejected } = $props<{
         sessionId: string;
@@ -19,41 +32,111 @@
     let terminating = $state(false);
 
     let isPending = $derived(!result && !rejected);
-    let isPatch = $derived(cmd.kind === "patch_file");
+    // patch 卡片视觉特化（accent 高亮 + diff 框）—— 4 个阶段任一都算
+    let isPatch = $derived(
+        cmd.kind === "patch_cp"
+        || cmd.kind === "patch_modify"
+        || cmd.kind === "patch_diff"
+        || cmd.kind === "patch_mv"
+    );
+    // download_file / analyze_locally 不走 PTY，approve 只发 ack 给后端；视觉无需特化。
+    let isAckOnly = $derived(cmd.kind === "download_file" || cmd.kind === "analyze_locally");
 
-    // 危险模式：每次新 command 进 chat 会创建一个新的 CommandConfirmDialog 实例，
-    // onMount 触发一次自动 approve。判断在前端，UI 上"提议→执行"全程仍可见，
-    // 审计 trail 完整；后端 emit 流程不变。挂载时若已有 result/rejected（历史记录回放）
-    // 自然跳过。
+    /** 把 kind 映射到 settings 上对应的 auto_* 字段 —— 命中即可自动批准。
+     *  default 分支用 `never` 哨兵：CommandKind 新增联合成员时这里类型推断会失败、
+     *  编译报错提醒补 case；同时运行时 fail-closed（type-violation 入参也不放过）。 */
+    function autoApproveAllowed(s: AiSettings | null, kind?: CommandKind): boolean {
+        if (!s || !s.danger_mode || !kind) return false;
+        switch (kind) {
+            case "run_command":     return s.auto_run_command;
+            case "match_file":      return s.auto_match_file;
+            case "download_file":   return s.auto_download_file;
+            case "analyze_locally": return s.auto_analyze_locally;
+            case "patch_cp":        return s.auto_patch_cp;
+            case "patch_modify":    return s.auto_patch_modify;
+            case "patch_diff":      return s.auto_patch_diff;
+            case "patch_mv":        return s.auto_patch_mv;
+            default: {
+                const _exhaustive: never = kind;
+                void _exhaustive;
+                return false;
+            }
+        }
+    }
+
+    // 自动批准：每次新 command 进 chat 会创建一个新的 CommandConfirmDialog 实例，
+    // onMount 触发一次按 kind 查 settings.auto_<kind>。UI 上"提议→执行"全程可见，
+    // 审计 trail 完整；后端 emit 流程不变。挂载时若已有 result/rejected（历史记录
+    // 回放）自然跳过。
     //
     // 重入防御：组件可能被销毁重建（panel close/reopen、chat list 重新 key 等）。
     // 重建实例的 executing=false，单看 executing 拦不住第二次 approve —— 同一 tool_call_id
     // 会被粘到 PTY 两次（rm/reboot 双执行级别的灾难）。用全局 _runningExecutions 表
     // （isCommandRunning）守门：命令还在 in-flight 时拒绝再次自动批准。
     //
-    // patch_file 永远走人审：文件改动的代价比 run_command 高，danger_mode 是"接受
-    // 命令风险"，不等于"接受任意文件改动"。强制用户看 diff 是这一类工具的契约。
+    // 历史卡片没有 kind 字段 → autoApproveAllowed 返回 false → 走人审，符合 fail-safe。
     onMount(() => {
         if (
             isPending
             && !executing
-            && !isPatch
             && !ai.isCommandRunning(cmd.tool_call_id)
-            && ai.settings()?.danger_mode
+            && !_ackedToolCalls.has(cmd.tool_call_id)
+            && autoApproveAllowed(ai.settings(), cmd.kind)
         ) {
             void approve();
         }
     });
 
+    // result / rejected prop 抵达 → 把对应 tool_call_id 从 _ackedToolCalls 移除。
+    // 此后该 dialog 再 remount 走的是 isPending=false 分支不会触发 approve，
+    // Set 也不会无限增长。
+    $effect(() => {
+        if (result || rejected) {
+            _ackedToolCalls.delete(cmd.tool_call_id);
+        }
+    });
+
     async function approve() {
         if (executing) return;
+        if (isAckOnly && _ackedToolCalls.has(cmd.tool_call_id)) return;
         executing = true;
         try {
+            if (isAckOnly) {
+                // 不走 PTY：后端 actor 此刻阻塞在 wait_command_outcome 等批准结果。
+                // 投一个 stub result 让它继续，由后端自己跑 SFTP / 开窗，跑完会
+                // emit command_completed 把卡片切到结果态。executing 不在 finally 里
+                // reset —— 让卡片维持"executing"视觉直到 result prop 抵达。
+                //
+                // 双重守门防 invoke 失败 stuck：
+                // 1) 先 add 防 await 期间并发 onMount 撞重复 invoke
+                // 2) catch 里 delete 回退，让用户能重试
+                // 走到 return 之前 invoke 已 resolve，acked 状态留着到 result 抵达
+                _ackedToolCalls.add(cmd.tool_call_id);
+                try {
+                    await invoke("ai_command_result", {
+                        sessionId,
+                        toolCallId: cmd.tool_call_id,
+                        exitCode: 0,
+                        output: "",
+                        timedOut: false,
+                        earlyTerminated: false,
+                    });
+                } catch (e) {
+                    _ackedToolCalls.delete(cmd.tool_call_id);
+                    throw e;
+                }
+                return;
+            }
             await ai.executeCommand(sessionId, cmd, targetKind, targetSessionId);
         } catch (e) {
             console.error("[ai] execute failed:", e);
             alert(t("ai.cmd.alert.exec_failed", { error: errMsg(e) }));
-        } finally {
+            executing = false;
+            terminating = false;
+            return;
+        }
+        // 成功路径：ack-only 等 result 抵达再 reset；PTY 路径 executeCommand 已等到 result。
+        if (!isAckOnly) {
             executing = false;
             terminating = false;
         }

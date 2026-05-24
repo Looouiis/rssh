@@ -16,8 +16,10 @@
     --elevation-pressed: none;
     /* A solid hairline. Mix text into bg (not transparent) — opaque,
        doesn't drift on alpha surfaces. ~45 brightness diff vs bg, both
-       light and dark palettes. */
-    --flat-border:         1px solid color-mix(in srgb, var(--text) 25%, var(--bg));
+       light and dark palettes.
+       拆开 color 单独 token —— shorthand 不能用作 background，多处复用就抽出来。 */
+    --flat-border-color:   color-mix(in srgb, var(--text) 25%, var(--bg));
+    --flat-border:         1px solid var(--flat-border-color);
     --flat-border-strong:  1px solid color-mix(in srgb, var(--text) 35%, var(--bg));
 }
 
@@ -63,26 +65,100 @@
     box-shadow: none;
 }
 
-/* Inputs: border instead of inset shadow. */
+/* Inputs: border instead of inset shadow. Includes the custom Select trigger
+   (Tauri webview ignores CSS on <option>, so we render a button + dropdown). */
 :root[data-shape="flat"] input,
 :root[data-shape="flat"] select,
-:root[data-shape="flat"] textarea {
+:root[data-shape="flat"] textarea,
+:root[data-shape="flat"] .rssh-select-trigger {
     border: var(--flat-border);
 }
+/* Open 态接缝：trigger 自带 border + list (.surface-raised) 自带 border，
+   贴在一起会成 2px 双线。抹掉 trigger 朝向 list 那一侧的 border，
+   接缝处只保留 list 的那一条；同时把 Select.svelte 默认的 divider 色覆盖成 flat-border
+   保持视觉一致。drop-up 时 list 在 trigger 上方，贴边在 list 的 bottom。 */
+:root[data-shape="flat"] .rssh-select.open:not(.drop-up) .rssh-select-trigger {
+    border-bottom-color: transparent;
+}
+:root[data-shape="flat"] .rssh-select.open.drop-up .rssh-select-trigger {
+    border-top-color: transparent;
+}
+:root[data-shape="flat"] .rssh-select:not(.drop-up) .rssh-select-list {
+    border-top: var(--flat-border);
+}
+:root[data-shape="flat"] .rssh-select.drop-up .rssh-select-list {
+    border-bottom: var(--flat-border);
+}
+/* List 内部 trigger 跟选项区之间的接缝 divider 也跟 flat-border 同色。
+   默认 ::before 用 var(--divider)，跟 trigger 的 flat-border 视觉不一致。 */
+:root[data-shape="flat"] .rssh-select-list::before {
+    background: var(--flat-border-color);
+}
 
-/* Checkbox/radio: outline when unchecked, solid when checked. */
+/* Checkbox / radio —— flat 风格：border + 中心 accent dot，跟 .shell-radio-indicator 同源。
+   覆盖 global.css 默认的"实色 accent 块 + 白勾"，统一三主题视觉。 */
 :root[data-shape="flat"] input[type="checkbox"],
 :root[data-shape="flat"] input[type="radio"] {
     border: var(--flat-border);
+    background: var(--surface);
+    box-shadow: none;
+    box-sizing: border-box;
+}
+:root[data-shape="flat"] input[type="checkbox"]::after,
+:root[data-shape="flat"] input[type="radio"]::after {
+    content: "";
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--accent);
+    border: none;
+    transform: translate(-50%, -50%) scale(0);
+    transition: transform 0.15s ease-out;
 }
 :root[data-shape="flat"] input[type="checkbox"]:checked,
 :root[data-shape="flat"] input[type="radio"]:checked {
+    background: var(--surface);
     box-shadow: none;
+    border-color: var(--accent);
+}
+:root[data-shape="flat"] input[type="checkbox"]:checked::after,
+:root[data-shape="flat"] input[type="radio"]:checked::after {
+    transform: translate(-50%, -50%) scale(1);
 }
 
 /* Switch slider: thin border instead of inset. */
 :root[data-shape="flat"] .switch .slider {
     border: var(--flat-border);
+}
+
+/* ShellSettings 自定义 radio —— flat 实现：边框风格，无阴影。
+   未选中 = 空心圆 + 普通 border；选中 = accent border + 中心 accent 实心圆点（scale 动画）。 */
+:root[data-shape="flat"] .shell-radio-indicator {
+    border: var(--flat-border);
+    background: var(--surface);
+    box-sizing: border-box;
+    transition: border-color 0.15s;
+}
+:root[data-shape="flat"] .shell-radio-indicator::after {
+    content: "";
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--accent);
+    transform: translate(-50%, -50%) scale(0);
+    transition: transform 0.15s ease-out;
+}
+:root[data-shape="flat"] input[type="radio"]:checked ~ label .shell-radio-indicator {
+    border-color: var(--accent);
+}
+:root[data-shape="flat"] input[type="radio"]:checked ~ label .shell-radio-indicator::after {
+    transform: translate(-50%, -50%) scale(1);
 }
 
 /* 选中 tab：accent 整块反白填充。idle/hover 由组件 scoped CSS 接管。 */

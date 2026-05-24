@@ -4,6 +4,15 @@
     import * as ai from "../ai/store.svelte.ts";
     import { t, errMsg } from "../i18n/index.svelte.ts";
     import type { LlmProvider, ModelInfo, SkillRecord } from "../ai/types.ts";
+    import Select from "./Select.svelte";
+
+    /** Provider 下拉选项 —— OpenAI 那项的翻译用 $derived 跟着 locale 自动重算。 */
+    let providerOptions = $derived([
+        { value: "anthropic", label: "Anthropic (Claude)" },
+        { value: "openai",    label: `OpenAI / ${t("ai.settings.provider.openai_compat")}` },
+        { value: "deepseek",  label: "DeepSeek" },
+        { value: "glm",       label: "GLM (智谱)" },
+    ]);
 
     function openExternal(e: MouseEvent, url: string) {
         e.preventDefault();
@@ -26,6 +35,19 @@
     let savingDanger = $state(false);
     let showDangerDialog = $state(false);
     let dangerNote = $state<string | null>(null);
+
+    // per-tool 自动批准。每个 checkbox 各自一个 boolean state。8 个字段平铺；
+    // 也可以塞成数组遍历，但显式 boolean 比 metadata 表调试时更直观，也避免一行
+    // toggle bug 同时拆掉 8 个开关。
+    let autoRunCommand = $state(true);
+    let autoMatchFile = $state(true);
+    let autoDownloadFile = $state(false);
+    let autoAnalyzeLocally = $state(false);
+    let autoPatchCp = $state(false);
+    let autoPatchModify = $state(false);
+    let autoPatchDiff = $state(false);
+    let autoPatchMv = $state(false);
+    let savingAuto = $state(false);
 
     /** onclick + preventDefault：Tauri webview 不支持原生 confirm()，且依赖 checkbox
      *  默认 toggle 会导致 cancel 后 DOM 与 Svelte state 错位。这里手动接管：
@@ -50,6 +72,33 @@
             dangerNote = t("ai.settings.danger.save_failed", { error: errMsg(err) });
         } finally {
             savingDanger = false;
+        }
+    }
+
+    /** 子开关写回后端。失败把 UI 状态回滚到 prev，避免界面与持久化失同步。 */
+    async function persistAuto(field: "autoRunCommand" | "autoMatchFile" | "autoDownloadFile"
+                                    | "autoAnalyzeLocally" | "autoPatchCp" | "autoPatchModify"
+                                    | "autoPatchDiff" | "autoPatchMv",
+                               next: boolean) {
+        savingAuto = true;
+        dangerNote = null;
+        try {
+            await ai.saveSettings({ [field]: next });
+        } catch (err) {
+            // 任一保存失败都把对应字段回滚——单 source of truth 是后端
+            switch (field) {
+                case "autoRunCommand":     autoRunCommand     = !next; break;
+                case "autoMatchFile":      autoMatchFile      = !next; break;
+                case "autoDownloadFile":   autoDownloadFile   = !next; break;
+                case "autoAnalyzeLocally": autoAnalyzeLocally = !next; break;
+                case "autoPatchCp":        autoPatchCp        = !next; break;
+                case "autoPatchModify":    autoPatchModify    = !next; break;
+                case "autoPatchDiff":      autoPatchDiff      = !next; break;
+                case "autoPatchMv":        autoPatchMv        = !next; break;
+            }
+            dangerNote = t("ai.settings.danger.save_failed", { error: errMsg(err) });
+        } finally {
+            savingAuto = false;
         }
     }
     let modelOptions = $state<ModelInfo[]>([]);
@@ -158,6 +207,14 @@
         endpoint = s.endpoint ?? "";
         hasKey = s.has_api_key;
         dangerMode = s.danger_mode;
+        autoRunCommand = s.auto_run_command;
+        autoMatchFile = s.auto_match_file;
+        autoDownloadFile = s.auto_download_file;
+        autoAnalyzeLocally = s.auto_analyze_locally;
+        autoPatchCp = s.auto_patch_cp;
+        autoPatchModify = s.auto_patch_modify;
+        autoPatchDiff = s.auto_patch_diff;
+        autoPatchMv = s.auto_patch_mv;
         if (hasKey) void autoLoadModels();
         await refreshSkills();
     });
@@ -276,24 +333,24 @@
 </script>
 
 <div class="page">
-    <div class="warn">
-        {t("ai.settings.warn.byok")}
-        （<a href="https://www.anthropic.com/legal/privacy" onclick={(e) => openExternal(e, "https://www.anthropic.com/legal/privacy")}>Anthropic</a>
-         / <a href="https://openai.com/policies/privacy-policy/" onclick={(e) => openExternal(e, "https://openai.com/policies/privacy-policy/")}>OpenAI</a>
-         / <a href="https://platform.deepseek.com/downloads" onclick={(e) => openExternal(e, "https://platform.deepseek.com/downloads")}>DeepSeek</a>
-         / <a href="https://docs.bigmodel.cn/cn/terms/privacy-policy" onclick={(e) => openExternal(e, "https://docs.bigmodel.cn/cn/terms/privacy-policy")}>GLM</a>）。
-    </div>
-
     <div class="section-label">{t("ai.settings.section.provider")}</div>
-    <div class="form">
+    <!-- Provider & Model + BYOK 警告合在一个 .card.surface-raised（跟 .danger-card / GitHubSyncScreen 同款）。
+         .warn 留在卡片顶部作"PAT hint"的等价位置，但保留自身警告样式（border-left + tint bg）。 -->
+    <div class="card surface-raised provider-card">
+        <div class="warn">
+            {t("ai.settings.warn.byok")}
+            （<a href="https://www.anthropic.com/legal/privacy" onclick={(e) => openExternal(e, "https://www.anthropic.com/legal/privacy")}>Anthropic</a>
+             / <a href="https://openai.com/policies/privacy-policy/" onclick={(e) => openExternal(e, "https://openai.com/policies/privacy-policy/")}>OpenAI</a>
+             / <a href="https://platform.deepseek.com/downloads" onclick={(e) => openExternal(e, "https://platform.deepseek.com/downloads")}>DeepSeek</a>
+             / <a href="https://docs.bigmodel.cn/cn/terms/privacy-policy" onclick={(e) => openExternal(e, "https://docs.bigmodel.cn/cn/terms/privacy-policy")}>GLM</a>）。
+        </div>
+
         <div class="row">
             <label for="ai-provider">{t("ai.settings.label.provider")}</label>
-            <select id="ai-provider" bind:value={provider} onchange={onProviderChange}>
-                <option value="anthropic">Anthropic (Claude)</option>
-                <option value="openai">OpenAI / {t("ai.settings.provider.openai_compat")}</option>
-                <option value="deepseek">DeepSeek</option>
-                <option value="glm">GLM (智谱)</option>
-            </select>
+            <Select id="ai-provider"
+                    bind:value={provider as string}
+                    options={providerOptions}
+                    onchange={onProviderChange} />
         </div>
         <div class="row">
             <label for="ai-endpoint">{t("ai.settings.label.endpoint")}</label>
@@ -333,25 +390,85 @@
     </div>
 
     <div class="section-label">{t("ai.settings.danger.section")}</div>
-    <div class="switch-card danger" class:on={dangerMode}>
-        <div class="switch-card-body">
-            <div id="danger-mode-title" class="switch-card-title"
-                 class:on={dangerMode} class:off={!dangerMode}>
-                {t("ai.settings.danger.label")}
+    <!-- 危险模式 + 8 个 per-tool 自动批准合在一个 .card.surface-raised（参考 GitHubSyncScreen）。
+         视觉上是一组语义关联的配置，不再拆成两个浮空卡片。 -->
+    <div class="card surface-raised danger-card" class:on={dangerMode}>
+        <div class="danger-head">
+            <div class="danger-head-body">
+                <div id="danger-mode-title" class="danger-title"
+                     class:on={dangerMode} class:off={!dangerMode}>
+                    {t("ai.settings.danger.label")}
+                </div>
+                <div id="danger-mode-desc" class="danger-desc">{t("ai.settings.danger.desc")}</div>
+                {#if dangerNote}
+                    <div class="danger-err">{dangerNote}</div>
+                {/if}
             </div>
-            <div id="danger-mode-desc" class="switch-card-desc">{t("ai.settings.danger.desc")}</div>
-            {#if dangerNote}
-                <div class="danger-err">{dangerNote}</div>
-            {/if}
+            <label class="switch">
+                <input type="checkbox" checked={dangerMode}
+                       disabled={savingDanger}
+                       onclick={handleDangerToggle}
+                       aria-labelledby="danger-mode-title"
+                       aria-describedby="danger-mode-desc"/>
+                <span class="slider"></span>
+            </label>
         </div>
-        <label class="switch">
-            <input type="checkbox" checked={dangerMode}
-                   disabled={savingDanger}
-                   onclick={handleDangerToggle}
-                   aria-labelledby="danger-mode-title"
-                   aria-describedby="danger-mode-desc"/>
-            <span class="slider"></span>
-        </label>
+
+        <div class="card-divider"></div>
+
+        <!-- per-tool 自动批准。danger_mode 关时整组 disabled —— 视觉灰显，不隐藏，
+             让用户知道这些选项存在、是怎么分粒度的；开 danger 时立刻可用。 -->
+        <div class="auto-group" class:disabled={!dangerMode}>
+            <div class="auto-group-title">{t("ai.settings.danger.auto.section")}</div>
+            <label class="auto-row">
+                <input type="checkbox" bind:checked={autoRunCommand}
+                       disabled={!dangerMode || savingAuto}
+                       onchange={(e) => persistAuto("autoRunCommand", (e.target as HTMLInputElement).checked)}/>
+                <span>{t("ai.settings.danger.auto.run_command")}</span>
+            </label>
+            <label class="auto-row">
+                <input type="checkbox" bind:checked={autoMatchFile}
+                       disabled={!dangerMode || savingAuto}
+                       onchange={(e) => persistAuto("autoMatchFile", (e.target as HTMLInputElement).checked)}/>
+                <span>{t("ai.settings.danger.auto.match_file")}</span>
+            </label>
+            <label class="auto-row">
+                <input type="checkbox" bind:checked={autoDownloadFile}
+                       disabled={!dangerMode || savingAuto}
+                       onchange={(e) => persistAuto("autoDownloadFile", (e.target as HTMLInputElement).checked)}/>
+                <span>{t("ai.settings.danger.auto.download_file")}</span>
+            </label>
+            <label class="auto-row">
+                <input type="checkbox" bind:checked={autoAnalyzeLocally}
+                       disabled={!dangerMode || savingAuto}
+                       onchange={(e) => persistAuto("autoAnalyzeLocally", (e.target as HTMLInputElement).checked)}/>
+                <span>{t("ai.settings.danger.auto.analyze_locally")}</span>
+            </label>
+            <label class="auto-row">
+                <input type="checkbox" bind:checked={autoPatchCp}
+                       disabled={!dangerMode || savingAuto}
+                       onchange={(e) => persistAuto("autoPatchCp", (e.target as HTMLInputElement).checked)}/>
+                <span>{t("ai.settings.danger.auto.patch_cp")}</span>
+            </label>
+            <label class="auto-row">
+                <input type="checkbox" bind:checked={autoPatchModify}
+                       disabled={!dangerMode || savingAuto}
+                       onchange={(e) => persistAuto("autoPatchModify", (e.target as HTMLInputElement).checked)}/>
+                <span>{t("ai.settings.danger.auto.patch_modify")}</span>
+            </label>
+            <label class="auto-row">
+                <input type="checkbox" bind:checked={autoPatchDiff}
+                       disabled={!dangerMode || savingAuto}
+                       onchange={(e) => persistAuto("autoPatchDiff", (e.target as HTMLInputElement).checked)}/>
+                <span>{t("ai.settings.danger.auto.patch_diff")}</span>
+            </label>
+            <label class="auto-row">
+                <input type="checkbox" bind:checked={autoPatchMv}
+                       disabled={!dangerMode || savingAuto}
+                       onchange={(e) => persistAuto("autoPatchMv", (e.target as HTMLInputElement).checked)}/>
+                <span>{t("ai.settings.danger.auto.patch_mv")}</span>
+            </label>
+        </div>
     </div>
 
     <div class="section-label skill-header">
@@ -527,14 +644,83 @@
         padding-right: 0;
     }
 
-    /* 复用全局 .switch-card 样式（见 styles/global.css）。Danger 变体在"开启"时
-       把 title 颜色压成 --error——全局 .switch-card-title.on 默认是 --accent（绿），
-       这里特化让"危险态"视觉上无法忽视，防止用户开了忘了又跑命令。 */
-    .switch-card.danger.on .switch-card-title.on { color: var(--error); }
+    /* Provider / Danger 卡片：复用全局 .card.surface-raised 提供 bg + 阴影 + 圆角，
+       本地只加 padding + 内布局，跟 GitHubSyncScreen 同款。 */
+    .provider-card,
+    .danger-card {
+        padding: 18px;
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+    }
+
+    /* 主开关行：title/desc 在左，switch 在右；不再依赖全局 .switch-card 容器。 */
+    .danger-head {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+    }
+    .danger-head-body {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+    }
+    .danger-title {
+        font-size: 13px;
+        font-weight: 600;
+        color: var(--text);
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+    }
+    /* "开启"时压成 error 红 —— 让危险态视觉无法忽视，防止用户开了忘了又跑命令。 */
+    .danger-title.on { color: var(--error); }
+    .danger-desc {
+        font-size: 11px;
+        color: var(--text-dim);
+        line-height: 1.5;
+    }
     .danger-err {
-        margin-top: 6px;
         font-size: 12px;
         color: var(--error);
+    }
+
+    /* 卡片内分隔线：用负边距贯穿到卡片左右边缘，视觉上是"横切"而非缩进线。 */
+    .card-divider {
+        height: 1px;
+        background: var(--divider);
+        margin: 2px -18px;
+    }
+
+    /* per-tool 自动批准 —— 嵌在 .danger-card 内，不再有自己的 bg/border。 */
+    .auto-group {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+    }
+    .auto-group.disabled {
+        opacity: 0.5;
+    }
+    .auto-group-title {
+        font-size: 11px;
+        color: var(--text-sub);
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        margin-bottom: 4px;
+    }
+    .auto-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 13px;
+        cursor: pointer;
+    }
+    .auto-row input[type="checkbox"] {
+        cursor: pointer;
+    }
+    .auto-group.disabled .auto-row,
+    .auto-group.disabled .auto-row input[type="checkbox"] {
+        cursor: not-allowed;
     }
 
     /* Danger confirm dialog —— 仿 GitHubSyncScreen 的模态结构 */
