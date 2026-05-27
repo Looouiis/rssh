@@ -61,7 +61,10 @@ fn key_auto(name: &str) -> String {
 
 #[derive(Serialize)]
 pub struct AiSessionInfo {
-    pub session_id: String,
+    /// Tab 身份。actor 跟 tab 同寿命 —— SSH 断了重连，前端用 tab_id 仍能定位到
+    /// 同一个 actor，历史就回来了。
+    pub tab_id: String,
+    /// 当前绑定的 SSH/PTY session_id（重连时由 rebind 更新）。
     pub target_id: String,
     pub skill: String,
     pub model: String,
@@ -71,7 +74,7 @@ pub struct AiSessionInfo {
 impl From<&DiagnoseSession> for AiSessionInfo {
     fn from(s: &DiagnoseSession) -> Self {
         Self {
-            session_id: s.session_id.clone(),
+            tab_id: s.tab_id.clone(),
             target_id: s.target_id.clone(),
             skill: s.skill.clone(),
             model: s.model.clone(),
@@ -131,6 +134,7 @@ fn locale_label(locale: &str) -> &'static str {
 pub async fn ai_session_start(
     app: AppHandle,
     state: State<'_, AppState>,
+    tab_id: String,
     target_kind: String, // "ssh" | "local"
     target_id: String,
     skill: String,
@@ -140,10 +144,13 @@ pub async fn ai_session_start(
 ) -> AppResult<AiSessionInfo> {
     {
         let g = locked(&state.ai_sessions)?;
-        if g.values().any(|s| s.target_id == target_id) {
+        // 一个 tab 至多一个 actor。前端 ensureSession 已经做了"有 session 就复用"的判断，
+        // 但并发请求还是可能撞同一个 tab_id —— 这里 fail-fast，不静默覆盖。
+        // 注意：此处只是早退化检查；下面有 await 会释放锁，所以 insert 时还要再查一次。
+        if g.contains_key(&tab_id) {
             return Err(AppError::other(
                 "session_already_exists",
-                json!({ "target": target_id }),
+                json!({ "tab_id": tab_id }),
             ));
         }
     }
@@ -193,9 +200,8 @@ pub async fn ai_session_start(
     let system_prompt = skills::build_catalog_prompt(&state.db, locale_lbl, is_mobile)?;
     let user_skills_cache = skills::list_user(&state.db)?;
 
-    let session_id = uuid::Uuid::new_v4().to_string();
     let cfg = session::SessionConfig {
-        session_id: session_id.clone(),
+        tab_id: tab_id.clone(),
         target_id,
         skill: "general".to_string(),
         system_prompt,
@@ -208,20 +214,36 @@ pub async fn ai_session_start(
         data_dir: state.data_dir.clone(),
     };
 
-    let session = session::start(cfg, app)?;
-    let info = AiSessionInfo::from(&session);
-    locked(&state.ai_sessions)?.insert(session_id, session);
+    // 并发 start 防御：上方的 contains_key 检查到这里的 insert 之间夹着
+    // 几个 await（api_key / target 校验 / llm client 构造），锁会释放，两个
+    // 并发请求都可能通过第一轮检查。
+    //
+    // `session::start` 现在返回 `PendingSession`（actor **未 spawn**）—— 在
+    // 锁下再查一遍，撞了直接 return Err，PendingSession 就地 drop，actor
+    // 从未运行过、不会 emit `ai:session_ended:<tab_id>` 污染赢家的事件流。
+    let pending = session::start(cfg, app)?;
+    let info = AiSessionInfo::from(pending.info());
+    {
+        let mut g = locked(&state.ai_sessions)?;
+        if g.contains_key(&tab_id) {
+            return Err(AppError::other(
+                "session_already_exists",
+                json!({ "tab_id": tab_id }),
+            ));
+        }
+        g.insert(tab_id, pending.launch());
+    }
     Ok(info)
 }
 
 #[tauri::command]
 pub async fn ai_user_message(
     state: State<'_, AppState>,
-    session_id: String,
+    tab_id: String,
     text: String,
 ) -> AppResult<()> {
     let tx = locked(&state.ai_sessions)?
-        .get(&session_id)
+        .get(&tab_id)
         .map(|s| s.action_tx.clone())
         .ok_or_else(|| AppError::not_found("ai_session_not_found", json!({})))?;
     tx.send(UserAction::Message(text))
@@ -232,7 +254,7 @@ pub async fn ai_user_message(
 #[tauri::command]
 pub async fn ai_command_result(
     state: State<'_, AppState>,
-    session_id: String,
+    tab_id: String,
     tool_call_id: String,
     exit_code: i32,
     output: String,
@@ -240,7 +262,7 @@ pub async fn ai_command_result(
     early_terminated: Option<bool>,
 ) -> AppResult<()> {
     let tx = locked(&state.ai_sessions)?
-        .get(&session_id)
+        .get(&tab_id)
         .map(|s| s.action_tx.clone())
         .ok_or_else(|| AppError::not_found("ai_session_not_found", json!({})))?;
     tx.send(UserAction::CommandResult {
@@ -257,12 +279,12 @@ pub async fn ai_command_result(
 #[tauri::command]
 pub async fn ai_command_reject(
     state: State<'_, AppState>,
-    session_id: String,
+    tab_id: String,
     tool_call_id: String,
     reason: String,
 ) -> AppResult<()> {
     let tx = locked(&state.ai_sessions)?
-        .get(&session_id)
+        .get(&tab_id)
         .map(|s| s.action_tx.clone())
         .ok_or_else(|| AppError::not_found("ai_session_not_found", json!({})))?;
     tx.send(UserAction::RejectCommand {
@@ -273,12 +295,85 @@ pub async fn ai_command_reject(
     Ok(())
 }
 
+/// 销毁 actor。前端在 tab close 时调（panel close 只隐藏 UI，不调这个）。
 #[tauri::command]
-pub async fn ai_session_stop(state: State<'_, AppState>, session_id: String) -> AppResult<()> {
+pub async fn ai_session_stop(state: State<'_, AppState>, tab_id: String) -> AppResult<()> {
     let session = locked(&state.ai_sessions)?
-        .remove(&session_id)
+        .remove(&tab_id)
         .ok_or_else(|| AppError::not_found("ai_session_not_found", json!({})))?;
     let _ = session.action_tx.send(UserAction::Stop);
+    Ok(())
+}
+
+/// 清空 actor 的 history（保留 audit log）。
+/// 用户手动按"清理上下文"按钮触发。actor 不死，下条 message 进来时是全新对话。
+#[tauri::command]
+pub async fn ai_session_clear_context(
+    state: State<'_, AppState>,
+    tab_id: String,
+) -> AppResult<()> {
+    let tx = locked(&state.ai_sessions)?
+        .get(&tab_id)
+        .map(|s| s.action_tx.clone())
+        .ok_or_else(|| AppError::not_found("ai_session_not_found", json!({})))?;
+    tx.send(UserAction::ClearContext)
+        .map_err(|_| AppError::other("ai_session_stopped", json!({})))?;
+    Ok(())
+}
+
+/// SSH 重连后重新绑定 target。actor 内部更新 target_id + ssh_handle，让
+/// 后续 file_ops / SFTP 走新连接。history / audit / pending 全保留。
+///
+/// 错误模型：target_id 必须在 state.sessions / pty_sessions 里存在，否则
+/// rebind 后立即触发的 file_ops 会拿到孤儿 handle 失败。前端通常在 SSH 重连
+/// 成功后立刻调，target 存在是常态。
+#[tauri::command]
+pub async fn ai_session_rebind_target(
+    state: State<'_, AppState>,
+    tab_id: String,
+    target_kind: String, // "ssh" | "local"
+    target_id: String,
+) -> AppResult<()> {
+    // 重新抓 ssh_handle（local 是 None）—— 复用 ai_session_start 的同款校验。
+    let ssh_handle = match target_kind.as_str() {
+        "ssh" => {
+            let g = locked(&state.sessions)?;
+            let h = g
+                .get(&target_id)
+                .ok_or_else(|| AppError::not_found("ssh_session_not_found", json!({})))?;
+            Some(h.ssh_handle().clone())
+        }
+        #[cfg(not(target_os = "android"))]
+        "local" => {
+            if !locked(&state.pty_sessions)?.contains_key(&target_id) {
+                return Err(AppError::not_found("local_pty_not_found", json!({})));
+            }
+            None
+        }
+        _ => {
+            return Err(AppError::config(
+                "unknown_target_kind",
+                json!({ "kind": target_kind }),
+            ))
+        }
+    };
+
+    // 锁里一次完成：拿 action_tx + 同步更新 stored target_id。
+    // 不更新 stored 那一份的话，ai_list_sessions / AiSessionInfo::from 会一直
+    // 报老 target_id；前端 resync 时反向把本地缓存覆盖回旧值。
+    let tx = {
+        let mut g = locked(&state.ai_sessions)?;
+        let s = g
+            .get_mut(&tab_id)
+            .ok_or_else(|| AppError::not_found("ai_session_not_found", json!({})))?;
+        s.target_id = target_id.clone();
+        s.action_tx.clone()
+    };
+    tx.send(UserAction::RebindTarget {
+        target_id,
+        ssh_handle,
+    })
+    .map_err(|_| AppError::other("ai_session_stopped", json!({})))?;
     Ok(())
 }
 
@@ -288,10 +383,10 @@ pub async fn ai_session_stop(state: State<'_, AppState>, session_id: String) -> 
 #[tauri::command]
 pub async fn ai_cancel_stream(
     state: State<'_, AppState>,
-    session_id: String,
+    tab_id: String,
 ) -> AppResult<()> {
     let slot = locked(&state.ai_sessions)?
-        .get(&session_id)
+        .get(&tab_id)
         .map(|s| s.cancel_slot.clone())
         .ok_or_else(|| AppError::not_found("ai_session_not_found", json!({})))?;
     // 先把 Notify clone 出来再释放锁——slot 用的是 std::sync::Mutex，
@@ -310,11 +405,11 @@ pub async fn ai_cancel_stream(
 #[tauri::command]
 pub async fn ai_audit_save(
     state: State<'_, AppState>,
-    session_id: String,
+    tab_id: String,
     file_path: String,
 ) -> AppResult<()> {
     let audit = locked(&state.ai_sessions)?
-        .get(&session_id)
+        .get(&tab_id)
         .map(|s| s.audit.clone())
         .ok_or_else(|| AppError::not_found("ai_session_not_found", json!({})))?;
     let g = audit.lock().map_err(|_| AppError::Lock)?;
@@ -327,24 +422,24 @@ pub async fn ai_audit_save(
 #[tauri::command]
 pub async fn ai_audit_save_pick(
     state: State<'_, AppState>,
-    session_id: String,
+    tab_id: String,
 ) -> AppResult<Option<String>> {
     #[cfg(target_os = "android")]
     {
-        let _ = (state, session_id);
+        let _ = (state, tab_id);
         Err(AppError::other("android_no_dialog", json!({})))
     }
     #[cfg(not(target_os = "android"))]
     {
         let audit = locked(&state.ai_sessions)?
-            .get(&session_id)
+            .get(&tab_id)
             .map(|s| s.audit.clone())
             .ok_or_else(|| AppError::not_found("ai_session_not_found", json!({})))?;
 
         let default_dir = dirs::document_dir().unwrap_or_else(|| PathBuf::from("."));
         let default_name = format!(
             "rssh-diagnose-{}-{}.log",
-            &session_id[..session_id.len().min(8)],
+            &tab_id[..tab_id.len().min(8)],
             chrono::Local::now().format("%Y%m%d_%H%M%S")
         );
 
@@ -366,10 +461,10 @@ pub async fn ai_audit_save_pick(
 #[tauri::command]
 pub async fn ai_audit_get(
     state: State<'_, AppState>,
-    session_id: String,
+    tab_id: String,
 ) -> AppResult<super::audit::AuditLog> {
     let audit = locked(&state.ai_sessions)?
-        .get(&session_id)
+        .get(&tab_id)
         .map(|s| s.audit.clone())
         .ok_or_else(|| AppError::not_found("ai_session_not_found", json!({})))?;
     let g = audit.lock().map_err(|_| AppError::Lock)?;
