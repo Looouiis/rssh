@@ -333,23 +333,35 @@ export function terminalFocus(tabId: string) {
 }
 
 /** Read system clipboard. On desktop, goes through Rust to bypass
- *  WebKit's permission prompt for externally-sourced content. */
+ *  WebKit's permission prompt for externally-sourced content.
+ *  Falls back to `navigator.clipboard` if the Rust backend is unavailable
+ *  (e.g. Wayland without XWayland, or a headless environment). */
 export async function readClipboard(): Promise<string> {
   if (isMobile) {
     return navigator.clipboard.readText().catch(() => "");
   }
-  return invoke<string>("clipboard_read").catch(() => "");
+  try {
+    return await invoke<string>("clipboard_read");
+  } catch {
+    return navigator.clipboard.readText().catch(() => "");
+  }
 }
 
 /** Write text to the system clipboard. On desktop goes through Rust (arboard)
  *  — WKWebView's `navigator.clipboard.writeText` silently fails from a
- *  right-click / unfocused context. Mobile uses the web API. */
+ *  right-click / unfocused context. Mobile uses the web API.
+ *  Falls back to `navigator.clipboard` if the Rust backend is unavailable
+ *  (e.g. Wayland without XWayland, or a headless environment). */
 export async function writeClipboard(text: string): Promise<void> {
   if (isMobile) {
     await navigator.clipboard.writeText(text).catch(() => {});
     return;
   }
-  await invoke("clipboard_write", { text }).catch(() => {});
+  try {
+    await invoke("clipboard_write", { text });
+  } catch {
+    await navigator.clipboard.writeText(text).catch(() => {});
+  }
 }
 
 /* ─── Session registry (for broadcast) ─── */

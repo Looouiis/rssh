@@ -87,7 +87,7 @@ portable-pty = "0.8"
 # build time (see build-linux.sh). Excluded on Android like portable-pty.
 serialport = "4.9.0"
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
-arboard = "3"
+arboard = { version = "3", features = ["wayland-data-control"] }
 
 # Keychain — 各平台用各自原生 backend；Android 没有支持，自动降级到 DB
 [target.'cfg(target_os = "macos")'.dependencies]
