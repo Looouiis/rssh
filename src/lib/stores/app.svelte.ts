@@ -9,7 +9,7 @@ export const isMobile = /Android|iPhone|iPad/i.test(navigator.userAgent);
 /* ═══════════════════════════════════════════════════════
    Types
    ═══════════════════════════════════════════════════════ */
-export type TabType = "home" | "ssh" | "local" | "forward" | "edit";
+export type TabType = "home" | "ssh" | "local" | "serial" | "forward" | "edit";
 export interface Tab {
   id: string;
   type: TabType;
@@ -26,6 +26,8 @@ export type SettingsPage =
   | "credential-edit"
   | "forwards"
   | "forward-edit"
+  | "serial-profiles"
+  | "serial-profile-edit"
   | "snippets"
   | "highlights"
   | "github-sync"
@@ -58,6 +60,16 @@ export interface Credential {
 export interface Forward {
   id: string; name: string; type: string;
   local_port: number; remote_host: string; remote_port: number; profile_id: string;
+}
+export interface SerialProfile {
+  id: string; name: string; port: string;
+  baud_rate: number; data_bits: number; parity: string;
+  stop_bits: number; flow_control: string;
+  // Tabby-style extras (xany is a wire flag; the rest are terminal-layer)
+  xany: boolean;
+  input_newline: string; output_newline: string;
+  local_echo: boolean; backspace: string; slow_send: boolean;
+  input_mode: string; output_mode: string; login_script: string;
 }
 export interface Snippet { name: string; command: string; }
 export interface HighlightRule { keyword: string; color: string; enabled: boolean; }
@@ -232,6 +244,7 @@ export function settingsBack() {
   if (_settingsPage === "profile-edit") _settingsPage = "profiles";
   else if (_settingsPage === "credential-edit") _settingsPage = "credentials";
   else if (_settingsPage === "forward-edit") _settingsPage = "forwards";
+  else if (_settingsPage === "serial-profile-edit") _settingsPage = "serial-profiles";
   else if (_settingsPage === "import-ssh-config") _settingsPage = "import-export";
   else _settingsPage = "menu";
 }
@@ -286,6 +299,11 @@ export function sendArrow(dir: ArrowDir, mod: number) { _terminalArrowSender?.(d
 interface TerminalControls {
   getSelection(): string;
   paste(text: string): void;
+  /** Inject user text as input (snippet / broadcast). The pane applies its own
+   *  transport rules — serial EOL transform + slow-send — so callers here stay
+   *  transport-agnostic. NOT for control bytes (arrows/Esc/Tab): those are raw,
+   *  see sendToTerminal. */
+  sendText(text: string): void;
   focus(): void;
 }
 const _terminalControls = new Map<string, TerminalControls>();
@@ -300,6 +318,12 @@ export function terminalGetSelection(tabId: string): string {
 }
 export function terminalPaste(tabId: string, text: string) {
   _terminalControls.get(tabId)?.paste(text);
+}
+/** Snippet picker (and any "run this text" action): send user text to the
+ *  active terminal honoring its EOL. Distinct from sendToTerminal, which is for
+ *  raw control sequences and must never transform line endings. */
+export function sendTextToActiveTerminal(text: string) {
+  _terminalControls.get(_activeTabId)?.sendText(text);
 }
 /** Return keyboard focus to a tab's terminal — used by modals (snippet picker,
  *  search) that steal focus and must hand it back on close, else focus falls
@@ -332,7 +356,7 @@ export async function writeClipboard(text: string): Promise<void> {
 interface SessionEntry {
   tabId: string;
   sessionId: string;
-  type: "ssh" | "local";
+  type: "ssh" | "local" | "serial";
 }
 export interface SessionInfo extends SessionEntry {
   label: string;
@@ -390,12 +414,11 @@ export function sessionIdForTab(tabId: string): string | undefined {
 }
 
 export function broadcastToSessions(tabIds: string[], text: string) {
-  const data = Array.from(new TextEncoder().encode(text));
+  // Route through each pane's sendText (registered while mounted — all tabs
+  // mount, only the active one is visible). The pane owns its transport + the
+  // serial EOL/slow-send transform, so no per-type invoke switch belongs here.
   for (const tabId of tabIds) {
-    const s = _sessions.find(x => x.tabId === tabId);
-    if (!s) continue;
-    const cmd = s.type === "local" ? "pty_write" : "ssh_write";
-    invoke(cmd, { sessionId: s.sessionId, data });
+    _terminalControls.get(tabId)?.sendText(text);
   }
 }
 
@@ -404,6 +427,34 @@ let _snippetPickerOpen = $state(false);
 export function snippetPickerOpen() { return _snippetPickerOpen; }
 export function openSnippetPicker() { _snippetPickerOpen = true; }
 export function closeSnippetPicker() { _snippetPickerOpen = false; }
+
+/** Open a terminal tab from a saved serial profile (Home cards + the manager
+ *  use this). meta carries the config in snake_case — TerminalPane feeds it to
+ *  serial_open verbatim, no remapping. id is ignored (ad-hoc connects pass ""). */
+export function connectSerialProfile(sp: SerialProfile) {
+  addTab({
+    id: `serial:${crypto.randomUUID()}`,
+    type: "serial",
+    label: sp.name,
+    meta: {
+      port: sp.port,
+      baud_rate: String(sp.baud_rate),
+      data_bits: String(sp.data_bits),
+      parity: sp.parity,
+      stop_bits: String(sp.stop_bits),
+      flow_control: sp.flow_control,
+      xany: String(sp.xany),
+      input_newline: sp.input_newline,
+      output_newline: sp.output_newline,
+      local_echo: String(sp.local_echo),
+      backspace: sp.backspace,
+      slow_send: String(sp.slow_send),
+      input_mode: sp.input_mode,
+      output_mode: sp.output_mode,
+      login_script: sp.login_script,
+    },
+  });
+}
 
 /* ─── Terminal command block side-bar ─── */
 let _commandBlockBar = $state(true);
@@ -534,6 +585,17 @@ export async function loadCredentials(): Promise<Credential[]> {
 }
 export async function loadForwards(): Promise<Forward[]> {
   return invoke<Forward[]>("list_forwards");
+}
+export async function loadSerialProfiles(): Promise<SerialProfile[]> {
+  // Desktop-only: the command isn't registered on Android. Degrade to [] rather
+  // than rejecting, so callers (e.g. HomeScreen's Promise.all) don't break on mobile.
+  // On desktop the command IS registered, so a failure is a real problem (DB /
+  // serialization) — log it so it's diagnosable instead of silently showing "no
+  // profiles". Mobile stays quiet (expected "not registered").
+  return invoke<SerialProfile[]>("list_serial_profiles").catch((e) => {
+    if (!isMobile) console.warn("[serial] list_serial_profiles failed:", e);
+    return [];
+  });
 }
 export async function loadSnippets(): Promise<Snippet[]> {
   return invoke<Snippet[]>("load_snippets");

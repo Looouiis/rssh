@@ -19,6 +19,7 @@
     import StripBar from "./StripBar.svelte";
     import ChatPanel from "../ai/ChatPanel.svelte";
     import * as ai from "../ai/store.svelte.ts";
+    import type { AiTargetKind } from "../ai/types.ts";
     import {attachShortcuts, attachKeyup, type Shortcut} from "../keyboard/registry.ts";
     import {matchBinding, TAB_CYCLE} from "../keyboard/keymap.ts";
     import * as keymap from "../stores/keymap.svelte.ts";
@@ -93,7 +94,7 @@
                     // (mirrors MobileKeybar's canOpenAi guard).
                     if (ai.isOpen()) { ai.closePanel(); return; }
                     const tab = app.activeTab();
-                    const canOpen = !!tab && (tab.type === "ssh" || tab.type === "local") && !!app.sessionIdForTab(tab.id);
+                    const canOpen = !!tab && (tab.type === "ssh" || tab.type === "local" || tab.type === "serial") && !!app.sessionIdForTab(tab.id);
                     if (!canOpen) return false;
                     ai.openPanel();
                 },
@@ -272,7 +273,7 @@
     let aiVisible = $derived(
         ai.isOpen()
         && !!aiActiveTab
-        && (aiActiveTab.type === "ssh" || aiActiveTab.type === "local")
+        && (aiActiveTab.type === "ssh" || aiActiveTab.type === "local" || aiActiveTab.type === "serial")
         && !!aiSessionId
         && !app.settingsActive()
         // The Transfers popover does not affect AI panel visibility — overlay.
@@ -581,11 +582,16 @@
 
     function buildMenu(tab: Tab): CtxMenuItem[][] {
         const isTerminal = tab.type === "ssh" || tab.type === "local";
+        // Serial is also a text terminal — it gets copy/paste/search/snippets AND
+        // AI (the agent runs commands via manual-submit, no shell sentinel). It does
+        // NOT get open-in-new-window: a serial port is exclusive — a second window
+        // opening the same device would fail.
+        const isTextTerminal = isTerminal || tab.type === "serial";
         const isSsh = tab.type === "ssh";
         const sections: CtxMenuItem[][] = [];
 
         // Copy / Paste (+ UTC if selection is a timestamp) / Add-to-Snippets.
-        if (isTerminal) {
+        if (isTextTerminal) {
             const selection = app.terminalGetSelection(tab.id);
             const trimmed = selection?.trim() ?? "";
             // Parse the trimmed selection so timestamps with leading/trailing
@@ -643,7 +649,7 @@
             sections.push(copyPaste);
         }
 
-        if (isTerminal) {
+        if (isTextTerminal) {
             const items: CtxMenuItem[] = [
                 {
                     label: t("tab.context.search"),
@@ -668,6 +674,29 @@
             sections.push(items);
         }
 
+        // Serial control lines: DTR/RTS assert/deassert + break. Runtime ops on
+        // the open port (MCU reset, bootloader entry, break-to-debugger). Greyed
+        // out until the session exists (briefly during connect / after unplug).
+        if (tab.type === "serial") {
+            const sid = app.sessionIdForTab(tab.id);
+            const ctl = (cmd: string, extra: Record<string, unknown> = {}) => () =>
+                void invoke(cmd, {sessionId: sid, ...extra}).catch((e) => toast.error(errMsg(e)));
+            sections.push([
+                {
+                    label: t("serial.ctl"),
+                    disabled: !sid,
+                    onClick: () => {},
+                    submenu: [
+                        {label: t("serial.ctl.dtr_assert"), disabled: !sid, onClick: ctl("serial_set_dtr", {level: true})},
+                        {label: t("serial.ctl.dtr_deassert"), disabled: !sid, onClick: ctl("serial_set_dtr", {level: false})},
+                        {label: t("serial.ctl.rts_assert"), disabled: !sid, onClick: ctl("serial_set_rts", {level: true})},
+                        {label: t("serial.ctl.rts_deassert"), disabled: !sid, onClick: ctl("serial_set_rts", {level: false})},
+                        {label: t("serial.ctl.break"), disabled: !sid, onClick: ctl("serial_send_break")},
+                    ],
+                },
+            ]);
+        }
+
         sections.push([
             {
                 label: t("tab.context.clone"),
@@ -678,8 +707,8 @@
             {label: t("tab.context.close"), shortcut: keymap.format("tab.close"), onClick: () => app.closeTab(tab.id)},
         ]);
 
-        // AI 排障入口（ssh/local tab 才有，且需要已经连上 = 有 sessionId）
-        if (isTerminal) {
+        // AI 排障入口（ssh/local/serial tab 才有，且需要已经连上 = 有 sessionId）
+        if (isTextTerminal) {
             const sid = app.sessionIdForTab(tab.id);
             sections.push([
                 {
@@ -940,7 +969,7 @@
                      oncontextmenu={app.isMobile ? undefined : (e) => openCtxMenu(e, tab)}>
                     {#if tab.type === "home"}
                         <HomeScreen/>
-                    {:else if tab.type === "ssh" || tab.type === "local"}
+                    {:else if tab.type === "ssh" || tab.type === "local" || tab.type === "serial"}
                         <TerminalPane tabId={tab.id} tabType={tab.type} meta={tab.meta ?? {}}/>
                     {:else if tab.type === "forward"}
                         <ForwardPane tabId={tab.id} meta={tab.meta ?? {}}/>
@@ -962,7 +991,7 @@
                      title={t("common.resize_hint")}></div>
                 <ChatPanel
                     tabId={aiActiveTab.id}
-                    targetKind={aiActiveTab.type as "ssh" | "local"}
+                    targetKind={aiActiveTab.type as AiTargetKind}
                     targetId={aiSessionId}
                 />
             </aside>
