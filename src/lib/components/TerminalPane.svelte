@@ -1178,6 +1178,31 @@
             error: (msg) => terminal?.write(`\r\n\x1b[31m${msg}\x1b[0m\r\n`),
         });
 
+        // OSC 52: clipboard escape sequence (used by hx, vim, tmux, etc.)
+        // Format: \x1b]52;<clipboard>;<base64>\x07  — write
+        // Format: \x1b]52;<clipboard>;\x07          — read (request)
+        // <clipboard>: "c" = CLIPBOARD, "p" = PRIMARY, "s" = SECONDARY
+        terminal.parser.registerOscHandler(52, (data: string) => {
+            const sep = data.indexOf(";");
+            if (sep < 0) return false;
+            const b64 = data.slice(sep + 1);
+            if (b64) {
+                try {
+                    const text = atob(b64);
+                    app.writeClipboard(text);
+                } catch { /* invalid base64, ignore */ }
+            } else {
+                const clip = data.slice(0, sep) || "c";
+                app.readClipboard().then((text) => {
+                    try {
+                        const b64 = btoa(text);
+                        terminal?.write(`\x1b]52;${clip};${b64}\x1b\\`);
+                    } catch { /* ignore */ }
+                });
+            }
+            return true;
+        });
+
         // Command block tracker — marks Enter keypresses in normal buffer.
         blockTracker = createCommandBlockTracker(terminal);
         blockTracker.onChange(() => {
